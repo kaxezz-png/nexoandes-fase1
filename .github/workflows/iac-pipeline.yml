@@ -1,0 +1,314 @@
+name: iac-pipeline
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Accion a ejecutar"
+        type: choice
+        options:
+          - apply
+          - destroy
+        default: apply
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform-nexoandes
+  cancel-in-progress: false
+
+env:
+  TF_VERSION: "1.10.5"
+  AWS_REGION: us-east-1
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  # ---------------------------------------------------------------
+  # ETAPA 1 - Controles previos (sin credenciales AWS)
+  # ---------------------------------------------------------------
+  controles:
+    name: Controles previos
+    runs-on: ubuntu-latest
+    steps:
+      - name: Obtener codigo
+        uses: actions/checkout@v4
+
+      - name: Instalar Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: "Control 1 - Formato (terraform fmt -check)"
+        run: terraform fmt -check -recursive
+
+      - name: Inicializar sin backend
+        run: terraform init -backend=false -input=false
+
+      - name: "Control 2 - Validacion (terraform validate)"
+        run: terraform validate
+
+      - name: "Control 3 - Prueba IaC con aserciones (terraform test)"
+        run: terraform test
+
+      - name: Instalar tflint
+        uses: terraform-linters/setup-tflint@v4
+
+      - name: "Control 4 - Lint / calidad (tflint)"
+        run: |
+          for d in . modules/network modules/security modules/compute; do
+            echo "== tflint en $d =="
+            (cd "$d" && tflint --config "$GITHUB_WORKSPACE/.tflint.hcl")
+          done
+
+      - name: Instalar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: "Control 5 - Analisis de seguridad IaC (checkov)"
+        run: |
+          pip install --quiet checkov
+          checkov --directory . --framework terraform --config-file .checkov.yaml
+
+  # ---------------------------------------------------------------
+  # ETAPA 2 - Plan (propone cambios; NO ejecuta)
+  # ---------------------------------------------------------------
+  plan:
+    name: Plan
+    needs: controles
+    if: github.event_name != 'workflow_dispatch' || inputs.action == 'apply'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Obtener codigo
+        uses: actions/checkout@v4
+
+      - name: Instalar Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Credenciales temporales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Inicializar con backend remoto
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Generar plan
+        run: |
+          terraform plan -input=false -lock-timeout=60s -out=tfplan
+          terraform show -no-color tfplan > plan.txt
+
+      - name: Resumen del plan para revision
+        run: |
+          {
+            echo "### Plan de Terraform (commit ${GITHUB_SHA::7})"
+            echo '```'
+            head -c 60000 plan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Guardar plan como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: plan
+          path: |
+            tfplan
+            plan.txt
+          retention-days: 7
+
+  # ---------------------------------------------------------------
+  # ETAPA 3 - Gate / aprobacion manual (Environment con revisor)
+  # ---------------------------------------------------------------
+  gate:
+    name: Gate de aprobacion
+    needs: plan
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.action == 'apply')
+    runs-on: ubuntu-latest
+    environment: aprobacion-despliegue
+    steps:
+      - name: Registro de aprobacion
+        run: |
+          echo "Plan aprobado por: ${{ github.actor }}"
+          echo "Commit: ${GITHUB_SHA}"
+          echo "Ejecucion: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+  # ---------------------------------------------------------------
+  # ETAPA 4 - Apply del plan aprobado
+  # ---------------------------------------------------------------
+  apply:
+    name: Apply
+    needs: gate
+    runs-on: ubuntu-latest
+    outputs:
+      instance_id: ${{ steps.salidas.outputs.instance_id }}
+      public_ip: ${{ steps.salidas.outputs.public_ip }}
+    steps:
+      - name: Obtener codigo
+        uses: actions/checkout@v4
+
+      - name: Instalar Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Credenciales temporales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Descargar plan aprobado
+        uses: actions/download-artifact@v4
+        with:
+          name: plan
+
+      - name: Inicializar con backend remoto
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Apply del plan guardado
+        run: terraform apply -input=false -lock-timeout=60s tfplan
+
+      - name: Capturar outputs
+        id: salidas
+        run: |
+          echo "instance_id=$(terraform output -raw instance_id)" >> "$GITHUB_OUTPUT"
+          echo "public_ip=$(terraform output -raw public_ip)" >> "$GITHUB_OUTPUT"
+          terraform output
+
+  # ---------------------------------------------------------------
+  # ETAPA 5 - Verificacion independiente (output / AWS CLI / HTTP / plan posterior)
+  # ---------------------------------------------------------------
+  verificar:
+    name: Verificacion independiente
+    needs: apply
+    runs-on: ubuntu-latest
+    env:
+      INSTANCE_ID: ${{ needs.apply.outputs.instance_id }}
+      PUBLIC_IP: ${{ needs.apply.outputs.public_ip }}
+    steps:
+      - name: Obtener codigo
+        uses: actions/checkout@v4
+
+      - name: Instalar Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Credenciales temporales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: "A - Output de Terraform"
+        run: |
+          echo "Instance ID (output): ${INSTANCE_ID}"
+          echo "IP publica (output):  ${PUBLIC_IP}"
+
+      - name: "B - Consulta independiente al proveedor (AWS CLI)"
+        run: |
+          aws ec2 describe-instances --instance-ids "${INSTANCE_ID}" \
+            --query 'Reservations[0].Instances[0].{Id:InstanceId,Estado:State.Name,Tipo:InstanceType,IP:PublicIpAddress,Tags:Tags}' \
+            --output json
+
+      - name: "C - Verificacion HTTP del portal"
+        run: |
+          code=000
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://${PUBLIC_IP}/" || true)
+            echo "intento ${i}: HTTP ${code}"
+            if [ "${code}" = "200" ]; then break; fi
+            sleep 10
+          done
+          test "${code}" = "200"
+          echo "--- health.txt ---"
+          curl -s "http://${PUBLIC_IP}/health.txt"
+          echo "--- correlacion por Instance ID ---"
+          curl -s "http://${PUBLIC_IP}/" | grep -F "${INSTANCE_ID}"
+
+      - name: Plan posterior (idempotencia)
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+          terraform plan -input=false -lock-timeout=60s -detailed-exitcode
+
+  # ---------------------------------------------------------------
+  # ETAPA 6 - Destroy controlado + verificacion de limpieza
+  # ---------------------------------------------------------------
+  destroy:
+    name: Destroy y verificacion de limpieza
+    needs: controles
+    if: github.event_name == 'workflow_dispatch' && inputs.action == 'destroy'
+    runs-on: ubuntu-latest
+    environment: aprobacion-despliegue
+    steps:
+      - name: Obtener codigo
+        uses: actions/checkout@v4
+
+      - name: Instalar Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Credenciales temporales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Inicializar con backend remoto
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Plan de destruccion
+        run: |
+          terraform plan -destroy -input=false -lock-timeout=60s -out=tfdestroy
+          terraform show -no-color tfdestroy
+
+      - name: Destroy
+        run: terraform apply -input=false -lock-timeout=60s tfdestroy
+
+      - name: Verificacion independiente de limpieza (AWS CLI)
+        run: |
+          N=$(sed -n 's/^student_number *= *\([0-9]*\).*/\1/p' fase1.auto.tfvars)
+          echo "Buscando recursos Project=NexoAndes StudentNumber=${N}"
+          inst=$(aws ec2 describe-instances \
+            --filters "Name=tag:Project,Values=NexoAndes" "Name=tag:StudentNumber,Values=${N}" \
+                      "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query 'Reservations[].Instances[].InstanceId' --output text)
+          vpcs=$(aws ec2 describe-vpcs \
+            --filters "Name=tag:Project,Values=NexoAndes" "Name=tag:StudentNumber,Values=${N}" \
+            --query 'Vpcs[].VpcId' --output text)
+          echo "Instancias restantes: [${inst}]"
+          echo "VPC restantes: [${vpcs}]"
+          test -z "${inst}" && test -z "${vpcs}"

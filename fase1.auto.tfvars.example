@@ -1,0 +1,4 @@
+# Copia este archivo como fase1.auto.tfvars y completa tus datos.
+# Son datos de identificacion, NO secretos: este archivo si se versiona.
+student_name   = "Nombre Apellido"
+student_number = 0 # tu numero de lista (1-254)

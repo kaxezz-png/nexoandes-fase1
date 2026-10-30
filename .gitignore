@@ -1,0 +1,17 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+plan.bin
+crash.log
+
+# Variables locales (pueden tener datos sensibles)
+*.tfvars
+!fase1.auto.tfvars
+!*.tfvars.example
+
+# Secretos
+*.pem
+*.key
+.env

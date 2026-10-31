@@ -1,7 +1,7 @@
 # NexoAndes Portal Operacional V1 - Fase 1 (IaC)
 
 Evaluacion Sumativa U1 - IC106TICL Automatizacion de Infraestructura con IaC.
-Autor: **[TU NOMBRE COMPLETO]** - N.o de lista: **[N]**
+Autor: **Camilo Sebastián Muñoz Ortiz** - N.o de lista: **[N]**
 
 Infraestructura AWS del Portal Operacional descrita con Terraform (root module + modulos locales),
 versionada con Git y desplegada mediante un pipeline de GitHub Actions con controles, plan y gate.
